@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use btleplug::{
-    api::{bleuuid::BleUuid, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
+    api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
     platform::{Manager, Peripheral},
 };
 use chrono::{DateTime, Utc};
@@ -32,6 +32,9 @@ struct Args {
     /// Exit after the first reading from each sensor
     #[arg(long)]
     once: bool,
+    /// Show 0xEC88 manufacturer advertisements and decoding (on stderr)
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -39,7 +42,7 @@ struct Reading {
     name: String,
     address: String,
     temperature_c: f32,
-    temperature_f: f32,
+    dew_point_c: Option<f32>,
     humidity_percent: f32,
     battery_percent: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +76,7 @@ async fn main() -> Result<(), Error> {
     tokio::pin!(deadline);
     let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
-    let mut seen: HashMap<String, Reading> = HashMap::new();
+    let mut seen: HashMap<String, (Reading, Instant)> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -81,36 +84,18 @@ async fn main() -> Result<(), Error> {
             _ = &mut interrupted => break,
             event = events.next() => {
                 let Some(event) = event else { break };
-                let (id, advertisement) = match event {
-                    CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => (id, None),
-                    CentralEvent::ServiceDataAdvertisement { id, service_data } => {
-                        let payload = service_data.into_iter()
-                            .find(|(uuid, _)| uuid.to_ble_u16() == Some(0xEC88))
-                            .map(|(_, data)| data);
-                        (id, payload)
-                    }
-                    CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } => {
-                        let payload = manufacturer_data.into_iter()
-                            .find(|(company, _)| *company == 0xEC88 || *company == 0x88EC)
-                            .map(|(_, data)| data);
-                        (id, payload)
-                    }
-                    _ => continue,
-                };
+                let CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } = event else { continue };
+                // The H5075 measurement is under manufacturer ID 0xEC88, not a service UUID.
+                let Some(payload) = manufacturer_data.get(&0xEC88) else { continue };
                 let peripheral = match adapter.peripheral(&id).await { Ok(p) => p, Err(_) => continue };
-                if let Some(reading) = read_sensor(&peripheral, &args, advertisement.as_deref()).await {
-                    let key = reading.address.clone();
-                    let new = !seen.contains_key(&key);
-                    seen.insert(key, reading.clone());
-                    if args.once {
-                        if new { print_reading(&reading, args.json); }
-                    } else if args.json {
-                        print_reading(&reading, true);
-                    } else {
-                        print_reading(&reading, false);
-                    }
-                    if args.seconds.is_none() {
-                        break;
+                if let Some(reading) = read_sensor(&peripheral, &args, payload).await {
+                    let now = Instant::now();
+                    if should_print(seen.get(&reading.address), &reading, now, args.once) {
+                        seen.insert(reading.address.clone(), (reading.clone(), now));
+                        print_reading(&reading, args.json);
+                        if args.seconds.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -123,44 +108,54 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn read_sensor(
-    peripheral: &Peripheral,
-    args: &Args,
-    advertisement: Option<&[u8]>,
-) -> Option<Reading> {
+// Ignore repeated advertisements carrying the same measurement in a short burst.
+// A later advertisement is still printed even when the values have not changed.
+fn should_print(
+    previous: Option<&(Reading, Instant)>,
+    current: &Reading,
+    now: Instant,
+    once: bool,
+) -> bool {
+    match previous {
+        None => true,
+        Some(_) if once => false,
+        Some((last, at)) => {
+            now.duration_since(*at) >= Duration::from_secs(2)
+                || last.temperature_c != current.temperature_c
+                || last.humidity_percent != current.humidity_percent
+                || last.battery_percent != current.battery_percent
+        }
+    }
+}
+
+async fn read_sensor(peripheral: &Peripheral, args: &Args, payload: &[u8]) -> Option<Reading> {
     let properties = peripheral.properties().await.ok().flatten()?;
-    let name = properties
-        .local_name
-        .unwrap_or_else(|| "Govee H5075".into());
+    let name = properties.local_name.as_deref();
     // CoreBluetooth does not expose MAC addresses. Its stable per-Mac UUID is
     // available as the peripheral ID; Peripheral::address() is all zeroes.
     let address = peripheral.id().to_string();
     if let Some(filter) = &args.filter {
         let f = filter.to_lowercase();
-        if !name.to_lowercase().contains(&f) && !address.to_lowercase().contains(&f) {
+        if !name.is_some_and(|n| n.to_lowercase().contains(&f))
+            && !address.to_lowercase().contains(&f)
+        {
             return None;
         }
     }
-    // The H5075 puts measurements in service data for UUID 0xEC88. This is a
-    // Govee service UUID, not a Bluetooth manufacturer/company identifier.
-    let service_payload = properties
-        .service_data
-        .iter()
-        .find(|(uuid, _)| uuid.to_ble_u16() == Some(0xEC88))
-        .map(|(_, data)| data.as_slice());
-    let manufacturer_payload = properties
-        .manufacturer_data
-        .iter()
-        .find(|(company, _)| **company == 0xEC88 || **company == 0x88EC)
-        .map(|(_, data)| data.as_slice());
-    let payload = advertisement.or(service_payload).or(manufacturer_payload)?;
-    let (temperature_c, humidity, battery) = decode(payload)?;
+    let measurement = decode(payload);
+    if args.debug {
+        eprintln!(
+            "[debug] {} ({address}) manufacturer 0xEC88: {payload:02X?} -> {measurement:?}",
+            name.unwrap_or("<unnamed>")
+        );
+    }
+    let (temperature_c, humidity, battery) = measurement?;
     let rssi = properties.rssi;
     Some(Reading {
-        name,
+        name: name.unwrap_or("Govee H5075").to_owned(),
         address,
-        temperature_f: temperature_c * 9.0 / 5.0 + 32.0,
         temperature_c,
+        dew_point_c: dew_point_c(temperature_c, humidity),
         humidity_percent: humidity,
         battery_percent: battery,
         rssi,
@@ -168,8 +163,18 @@ async fn read_sensor(
     })
 }
 
+fn dew_point_c(temperature_c: f32, humidity_percent: f32) -> Option<f32> {
+    if humidity_percent <= 0.0 {
+        return None;
+    }
+    let a = 17.27;
+    let b = 237.7;
+    let gamma = (humidity_percent / 100.0).ln() + a * temperature_c / (b + temperature_c);
+    Some(b * gamma / (a - gamma))
+}
+
 fn decode(data: &[u8]) -> Option<(f32, f32, u8)> {
-    // 0xEC88 service payload: packet type, combined temperature/humidity
+    // 0xEC88 manufacturer payload: packet type, combined temperature/humidity
     // (24-bit big endian), battery. The low three decimal digits are humidity
     // in tenths of a percent; the remaining digits are temperature in tenths.
     if data.len() < 5 {
@@ -192,15 +197,66 @@ fn decode(data: &[u8]) -> Option<(f32, f32, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::{decode, dew_point_c, should_print, Reading};
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn decodes_h5075_service_data() {
+    fn decodes_h5075_manufacturer_data() {
         // Combined value 235456 means 23.5 °C and 45.6% RH.
         assert_eq!(
-            decode(&[0x00, 0x03, 0x97, 0xC0, 87]),
+            decode(&[0x00, 0x03, 0x97, 0xC0, 87, 0x00]),
             Some((23.5, 45.6, 87))
         );
+    }
+
+    #[test]
+    fn decodes_captured_manufacturer_data_with_trailing_bytes() {
+        // btleplug may report additional bytes after the five measurement bytes.
+        assert_eq!(
+            decode(&[0x00, 0x03, 0x36, 0x9B, 0x56, 0x00, 0x4C, 0x00]),
+            Some((21.0, 58.7, 86))
+        );
+    }
+
+    #[test]
+    fn suppresses_only_short_bursts_of_identical_readings() {
+        let reading = Reading {
+            name: "GVH5075_50EE".into(),
+            address: "device-1".into(),
+            temperature_c: 21.0,
+            dew_point_c: Some(12.6),
+            humidity_percent: 58.7,
+            battery_percent: 86,
+            rssi: Some(-61),
+            timestamp: 0,
+        };
+        let start = Instant::now();
+        let previous = (reading.clone(), start);
+        let soon = start + Duration::from_millis(100);
+        assert!(should_print(None, &reading, start, false));
+        assert!(!should_print(Some(&previous), &reading, soon, false));
+        assert!(should_print(
+            Some(&previous),
+            &reading,
+            start + Duration::from_secs(2),
+            false
+        ));
+        let mut changed = reading.clone();
+        changed.temperature_c = 21.1;
+        assert!(should_print(Some(&previous), &changed, soon, false));
+        assert!(!should_print(Some(&previous), &changed, soon, true));
+    }
+
+    #[test]
+    fn calculates_dew_point_with_magnus_tetens() {
+        let dew_point = dew_point_c(20.0, 50.0).unwrap();
+        assert!((dew_point - 9.26).abs() < 0.02);
+        assert!((dew_point_c(20.0, 100.0).unwrap() - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn zero_humidity_has_no_finite_dew_point() {
+        assert_eq!(dew_point_c(20.0, 0.0), None);
     }
 }
 
@@ -212,11 +268,13 @@ fn print_reading(r: &Reading, json: bool) {
             .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| r.timestamp.to_string());
         println!(
-            "{:<22} {}   {:>7.2} °C / {:>7.2} °F   {:>6.2}% RH   {:>3}% battery{}",
+            "{:<22} {}   {:>7.2} °C   dew point {:>7} °C   {:>6.2}% RH   {:>3}% battery{}",
             r.name,
             timestamp,
             r.temperature_c,
-            r.temperature_f,
+            r.dew_point_c
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "n/a".into()),
             r.humidity_percent,
             r.battery_percent,
             r.rssi.map(|v| format!("   ({v} dBm)")).unwrap_or_default()
