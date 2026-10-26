@@ -2,6 +2,7 @@
 name = "govee5075"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Read Govee H5075 temperature/humidity sensors over Bluetooth"
 license = "MIT"
 
@@ -20,3 +21,4 @@ path = "src/main.rs"
 
 [profile.release]
 lto = true
+strip = "symbols"
