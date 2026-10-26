@@ -4,6 +4,10 @@ A small Rust CLI that reads Govee H5075 temperature/humidity sensors from their 
 
 By default it prints the first reading and exits. `--watch` keeps printing readings until interrupted. Identical readings from the same sensor arriving within two seconds are collapsed.
 
+`--history` connects to a sensor and downloads the readings stored on the
+device itself (one per minute, up to 20 days) over the GATT connection,
+no pairing required:
+
 ## Install and run
 
 ```sh
@@ -13,6 +17,12 @@ cargo run --release
 cargo run --release -- --watch
 # Only one sensor, matched by name or Bluetooth ID:
 cargo run --release -- --filter GVH5075_50EE
+# Download the readings stored on a sensor, oldest first:
+cargo run --release -- --history --filter GVH5075_50EE
+# Just the last 6 hours, ending 30 minutes ago:
+cargo run --release -- --history --start 6:00 --end 0:30
+# Everything the sensor keeps (20 days; takes a few minutes to transfer):
+cargo run --release -- --history --start 480:00 --end 0:00
 ```
 
 On first run, macOS may ask the terminal/application for Bluetooth permission. If no devices are found, enable **System Settings → Privacy & Security → Bluetooth** for the terminal you are using and keep the sensor awake and nearby. H5075 advertisements are read passively, so the sensor does not need to be paired.
@@ -37,6 +47,19 @@ GVH5075_50EE         1970-01-01T00:00:00Z  21.00  12.60  58.70  86   -61
 | 68–72 | RSSI | `rssi` | dBm, or `n/a` |
 
 Dew point uses the Magnus–Tetens formula and is `n/a` when relative humidity is zero.
+
+## History
+
+`--history` connects to the sensor and asks it to replay the per-minute
+readings it stores in flash (20 days = 28,800 records). `--start` and `--end`
+take `hhh:mm` back from now; a plain number means minutes. History rows use
+the same fixed-width layout as live readings, with `n/a` for battery and
+RSSI, so the same `cut -c` extraction works. Progress goes to stderr.
+
+The device streams its records as unordered notification batches; the tool
+anchors each record's timestamp to the moment the request was written and
+sorts the result. When the device reports having sent more messages than
+were received, a warning is printed and the rows are still emitted.
 
 ```sh
 # Just the temperature, one per line (heading goes to stderr, so is not included):
